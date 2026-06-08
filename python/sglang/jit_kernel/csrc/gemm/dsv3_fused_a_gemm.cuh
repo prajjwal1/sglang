@@ -18,10 +18,10 @@
  * limitations under the License.
  */
 
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>   // For RuntimeCheck
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, RuntimeDeviceCheck, bf16_t
+#include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -93,21 +93,14 @@ __device__ int apply_swizzle_343_on_elem_row_col(int row_idx_, int col_idx_) {
   return *reinterpret_cast<int*>(&col_idx);
 }
 
-__device__ void initialize_barrier(
-    uint64_t* smem_barrier,  // 64 bits user-manged barrier in smem
-    int thread_count = 1)    // Thread count expected to arrive/wait on this barrier
-{
+__device__ void initialize_barrier(uint64_t* smem_barrier, int thread_count = 1) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(smem_int_ptr), "r"(thread_count));
 #endif
 }
 
-// Barrier wait
-__device__ void wait_barrier(
-    uint64_t* smem_barrier,  // 64 bits user-manged barrier in smem
-    int phase_bit)           // Current phase bit the barrier waiting to flip
-{
+__device__ void wait_barrier(uint64_t* smem_barrier, int phase_bit) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile(
@@ -140,9 +133,7 @@ __device__ bool try_wait_barrier(uint64_t* smem_ptr, int phase_bit) {
   return false;
 }
 
-// Barrier arrive
-__device__ void arrive_barrier(uint64_t* smem_barrier)  // 64 bits user-manged barrier in smem
-{
+__device__ void arrive_barrier(uint64_t* smem_barrier) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   uint32_t smem_int_ptr = __nvvm_get_smem_pointer(smem_barrier);
   asm volatile(
@@ -171,7 +162,6 @@ struct GmemLoaderA {
   static_assert(gemm_k % tile_k == 0);
   static constexpr int k_iter_cnt = gemm_k / tile_k;
 
-  // Extra params to keep the order of k reduction...
   static constexpr int mma_warp_cnt = 4;
   static constexpr int per_mma_warp_k = tile_k / mma_warp_cnt;
   static constexpr int k_each_chunk = gemm_k / mma_warp_cnt;
@@ -187,7 +177,6 @@ struct GmemLoaderA {
 
   __device__ void prepare() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-// swizzle, that's what we want.
 #pragma unroll
     for (int i = 0; i < a_inst_cnt_per_iter; i++) {
       int linear_idx = local_tid * vec_elems + i * thread_cnt * vec_elems;
@@ -241,7 +230,6 @@ struct GmemLoaderA {
   int phase_bit = 1;
   bool need_wait = true;
 
-  // per smem_stage, store with swizzle information
   int a_smem_offsets[a_inst_cnt_per_iter];
 };
 
@@ -256,7 +244,6 @@ struct GmemLoaderB {
   static_assert(gemm_k % tile_k == 0);
   static constexpr int k_iter_cnt = gemm_k / tile_k;
 
-  // Extra params to keep the order of k reduction...
   static constexpr int mma_warp_cnt = 4;
   static constexpr int per_mma_warp_k = tile_k / mma_warp_cnt;
   static constexpr int k_each_chunk = gemm_k / mma_warp_cnt;
@@ -276,7 +263,6 @@ struct GmemLoaderB {
 
   __device__ void prepare() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-// swizzle, that's what we want.
 #pragma unroll
     for (int i = 0; i < b_inst_cnt_per_iter; i++) {
       int linear_idx = local_tid * vec_elems + i * thread_cnt * vec_elems;
@@ -332,7 +318,6 @@ struct GmemLoaderB {
   int phase_bit = 1;
   bool need_wait = true;
 
-  // per smem_stage, store with swizzle information
   int b_smem_offsets[b_inst_cnt_per_iter];
   uint32_t preds[b_inst_cnt_per_iter];
 };
@@ -347,7 +332,7 @@ struct MmaComputer {
   static constexpr int k_iter_cnt = gemm_k / tile_k;
   static constexpr int k_phase_cnt = per_warp_tile_k / 16;
   static constexpr int m_iter_cnt = (tile_m + 15) / 16;
-  static constexpr int n_iter_cnt = (tile_n + 7) / 8;  // Possible to have non-1 n_iter_cnt for ab_swap m16 case.
+  static constexpr int n_iter_cnt = (tile_n + 7) / 8;
   static_assert(m_iter_cnt == 1);
   static_assert(n_iter_cnt == 1 || n_iter_cnt == 2);
 
@@ -383,7 +368,7 @@ struct MmaComputer {
 #pragma unroll
     for (int n_iter_idx = 0; n_iter_idx < n_iter_cnt; n_iter_idx++) {
 #pragma unroll
-      for (int i = 0; i < k_phase_cnt; i += 2) {  // Special i+=2 for B.
+      for (int i = 0; i < k_phase_cnt; i += 2) {
         int linear_idx = internal_b_atom_func(lane_idx) + i * tile_n * 16 + n_iter_idx * 8;
         int n_idx = linear_idx % tile_n;
         int k_idx = linear_idx / tile_n + warp_k_offset_in_tile_k;
@@ -436,7 +421,6 @@ struct MmaComputer {
   __device__ void epi() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("bar.sync %0, %1;" : : "r"(1), "r"(thread_cnt));
-    // reorganize the acc_reg
     constexpr int thread_m = 2;
     constexpr int thread_n = 2 * n_iter_cnt;
     constexpr int cta_mma_n = n_iter_cnt * 8;
@@ -448,9 +432,7 @@ struct MmaComputer {
       }
     }
 
-    // 4 x cosize(smem_c_layout)
     float* smem_c = reinterpret_cast<float*>(smem_a);
-    // coord -> index
     auto smem_c_index_func = [&](int m_idx, int n_idx) {
       int group_rows = 32 / cta_mma_n;
       int group_cnt = 2;
@@ -458,7 +440,6 @@ struct MmaComputer {
     };
     constexpr int cosize_smem_c = ((tile_m * cta_mma_n) / 32) * (32 + 2);
 
-// This should be optimized to STS.64 but can not be STS.128 due to the bank index.
 #pragma unroll
     for (int m_idx_thread = 0; m_idx_thread < thread_m; m_idx_thread++) {
 #pragma unroll
@@ -517,7 +498,6 @@ struct MmaComputer {
   float acc_reg[m_iter_cnt][n_iter_cnt][4]{};
 };
 
-// AB swapped, kernel is k-major, k-major, m-major
 template <int batch_size, int gemm_m, int gemm_k, int tile_m, int tile_n, int tile_k, int stage_cnt>
 __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
     bf16_t* output, bf16_t const* mat_a, bf16_t const* mat_b, int gemm_n) {
@@ -529,20 +509,17 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
   static_assert(gemm_m % 16 == 0);
   static_assert(gemm_k % tile_k == 0);
   static_assert(gemm_m % tile_m == 0);
-  static_assert(
-      tile_k == 128 || tile_k == 256 || tile_k == 512 ||
-      tile_k == 1024);  // tile_k must be larger than 64 since 4 warp splitK.
+  static_assert(tile_k == 128 || tile_k == 256 || tile_k == 512 || tile_k == 1024);
   static_assert(tile_m == 16);
   constexpr int g2s_vec_bytes = 16;
   constexpr int a_elem_bytes = 2;
   constexpr int b_elem_bytes = 2;
-  // constexpr int c_elem_bytes = 2;
   static_assert((tile_m * a_elem_bytes + tile_n * b_elem_bytes) * tile_k * stage_cnt <= 225 * 1024);
   static_assert((tile_m * tile_k * a_elem_bytes) % (load_thread_cnt * g2s_vec_bytes) == 0);
   static_assert((tile_n * tile_k * b_elem_bytes) % (load_thread_cnt * g2s_vec_bytes) == 0);
 
   extern __shared__ char smem[];
-  uint64_t* smem_barrier = reinterpret_cast<uint64_t*>(smem);  // producer,consumer; producer,consumer; ...
+  uint64_t* smem_barrier = reinterpret_cast<uint64_t*>(smem);
   bf16_t* smem_a = reinterpret_cast<bf16_t*>(smem + (stage_cnt * 8 * 2 + 1024) / 1024 * 1024);
   bf16_t* smem_b = smem_a + tile_m * tile_k * stage_cnt;
 
@@ -556,8 +533,8 @@ __global__ __launch_bounds__(256, 1) void fused_a_gemm_kernel(
 
   if (warp_idx == 4) {
     for (int i = 0; i < stage_cnt; i++) {
-      initialize_barrier(smem_barrier + i * 2 + 0, load_thread_cnt);     // producer
-      initialize_barrier(smem_barrier + i * 2 + 1, compute_thread_cnt);  // consumer
+      initialize_barrier(smem_barrier + i * 2 + 0, load_thread_cnt);
+      initialize_barrier(smem_barrier + i * 2 + 1, compute_thread_cnt);
     }
   }
   __syncthreads();
@@ -598,8 +575,7 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
 #endif
   constexpr int max_stage_cnt = smem_stage_budget / ((tile_m + tile_n) * tile_k * sizeof(bf16_t));
   constexpr int k_iter_cnt = gemm_k / tile_k;
-  constexpr int stage_cnt =
-      k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;  // possible tunable for smallK > 1 wave n. // 22
+  constexpr int stage_cnt = k_iter_cnt > max_stage_cnt ? max_stage_cnt : k_iter_cnt;
   int cta_m_cnt = gemm_m / tile_m;
   int cta_n_cnt = (gemm_n + tile_n - 1) / tile_n;
   constexpr int barrier_bytes = (stage_cnt * 16 + 1023) / 1024 * 1024;  // 4096
@@ -615,7 +591,6 @@ void invokeFusedAGemm(T* output, T const* mat_a, T const* mat_b, int num_tokens,
   host::LaunchKernel(grid, block_size, device, smem_bytes).enable_pdl(kUsePDL)(kernel, output, mat_a, mat_b, gemm_n);
 }
 
-// kUsePDL: compile-time bool (true on SM90+)
 template <int kHdIn, int kHdOut, bool kUsePDL>
 struct DSV3FusedAGemmKernel {
   static void
