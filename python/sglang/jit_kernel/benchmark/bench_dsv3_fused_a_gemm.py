@@ -1,5 +1,5 @@
 """Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs
-sgl_kernel AOT vs torch, timed with CUPTI HW tracing (cold L2).
+sgl_kernel AOT vs torch.
 
 Run on SM90+ (Hopper or later):
     python -m sglang.jit_kernel.benchmark.bench_dsv3_fused_a_gemm
@@ -11,6 +11,7 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm as sgl_kernel_dsv3_fused_a_gemm
 
+from sglang.jit_kernel.benchmark import marker
 from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
     dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
 )
@@ -41,11 +42,15 @@ LINE_NAMES = ["CuTe DSL", "CUDA JIT", "sgl_kernel AOT", "torch F.linear"]
 STYLES = [("blue", "-"), ("orange", "--"), ("red", ":"), ("green", "-.")]
 
 
-def _median_us(fn) -> float:
-    from flashinfer.testing import bench_gpu_time_with_cupti
-
-    times = bench_gpu_time_with_cupti(fn, use_cuda_graph=False, cold_l2_cache=True)
-    return torch.tensor(times, dtype=torch.float64).median().item() * 1e3
+def _median_us(fn, *args) -> float:
+    result = marker.do_bench(
+        fn,
+        input_args=args,
+        use_cuda_graph=True,
+        metrics=(0.5,),
+        disable_log_bandwidth=True,
+    )
+    return result.times[0] * 1e6
 
 
 def _bench(num_tokens, provider, hd_in):
@@ -55,12 +60,12 @@ def _bench(num_tokens, provider, hd_in):
     mat_a = torch.randn((num_tokens, hd_in), dtype=DTYPE, device=DEVICE)
     mat_b = torch.randn((HD_OUT, hd_in), dtype=DTYPE, device=DEVICE).transpose(0, 1)
     fn_map = {
-        "cutedsl": lambda: cutedsl_dsv3_fused_a_gemm(mat_a, mat_b),
-        "jit": lambda: dsv3_fused_a_gemm(mat_a, mat_b),
-        "sgl_kernel": lambda: sgl_kernel_dsv3_fused_a_gemm(mat_a, mat_b),
-        "torch": lambda: F.linear(mat_a, mat_b.T),
+        "cutedsl": cutedsl_dsv3_fused_a_gemm,
+        "jit": dsv3_fused_a_gemm,
+        "sgl_kernel": sgl_kernel_dsv3_fused_a_gemm,
+        "torch": lambda a, b: F.linear(a, b.T),
     }
-    return _median_us(fn_map[provider])
+    return _median_us(fn_map[provider], mat_a, mat_b)
 
 
 @triton.testing.perf_report(
