@@ -1,6 +1,7 @@
-"""Benchmark for DeepSeek V3 fused QKV-A GEMM (JIT kernel vs sgl_kernel AOT vs torch).
+"""Benchmark for DeepSeek V3 fused QKV-A GEMM: CuTe DSL vs CUDA JIT vs
+sgl_kernel AOT vs torch, timed with CUPTI HW tracing (cold L2).
 
-Run on a Hopper (SM90+) GPU:
+Run on SM90+ (Hopper or later):
     python -m sglang.jit_kernel.benchmark.bench_dsv3_fused_a_gemm
 """
 
@@ -10,54 +11,76 @@ import triton
 import triton.testing
 from sgl_kernel import dsv3_fused_a_gemm as sgl_kernel_dsv3_fused_a_gemm
 
-from sglang.jit_kernel.benchmark.utils import run_benchmark_cupti
+from sglang.jit_kernel.cutedsl_dsv3_fused_a_gemm import (
+    dsv3_fused_a_gemm as cutedsl_dsv3_fused_a_gemm,
+)
 from sglang.jit_kernel.dsv3_fused_a_gemm import dsv3_fused_a_gemm
 from sglang.jit_kernel.utils import get_jit_cuda_arch, is_hip_runtime
+from sglang.srt.utils.common import is_sm120_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.utils import is_in_ci
 
-register_cuda_ci(est_time=5, suite="base-b-kernel-benchmark-1-gpu-large")
+register_cuda_ci(est_time=12, suite="base-b-kernel-benchmark-1-gpu-large")
 
 IS_CI = is_in_ci()
 
 DTYPE = torch.bfloat16
 DEVICE = "cuda"
-HD_IN = 7168
 HD_OUT = 2112
+HD_IN_LIST = [6144, 7168]
+
+# The AOT kernel is hardcoded to HD_IN=7168 and its shared-memory budget exceeds
+# the SM120 (Blackwell) device limit, so it only runs on pre-Blackwell + 7168.
+AOT_HD_IN = 7168
+HAS_AOT = not is_sm120_supported()
 
 NUM_TOKENS_LIST = [1, 8, 16] if IS_CI else list(range(1, 17))
 
-LINE_VALS = ["jit", "sgl_kernel", "torch"]
-LINE_NAMES = ["SGL JIT Kernel", "sgl_kernel AOT", "torch F.linear"]
-STYLES = [("blue", "--"), ("red", ":"), ("green", "-.")]
+LINE_VALS = ["cutedsl", "jit", "sgl_kernel", "torch"]
+LINE_NAMES = ["CuTe DSL", "CUDA JIT", "sgl_kernel AOT", "torch F.linear"]
+STYLES = [("blue", "-"), ("orange", "--"), ("red", ":"), ("green", "-.")]
 
 
-def _bench(num_tokens, provider):
-    mat_a = torch.randn((num_tokens, HD_IN), dtype=DTYPE, device=DEVICE)
-    mat_b = torch.randn((HD_OUT, HD_IN), dtype=DTYPE, device=DEVICE).transpose(0, 1)
+def _median_us(fn) -> float:
+    from flashinfer.testing import bench_gpu_time_with_cupti
+
+    times = bench_gpu_time_with_cupti(fn, use_cuda_graph=False, cold_l2_cache=True)
+    return torch.tensor(times, dtype=torch.float64).median().item() * 1e3
+
+
+def _bench(num_tokens, provider, hd_in):
+    if provider == "sgl_kernel" and not (HAS_AOT and hd_in == AOT_HD_IN):
+        return float("nan")
+
+    mat_a = torch.randn((num_tokens, hd_in), dtype=DTYPE, device=DEVICE)
+    mat_b = torch.randn((HD_OUT, hd_in), dtype=DTYPE, device=DEVICE).transpose(0, 1)
     fn_map = {
+        "cutedsl": lambda: cutedsl_dsv3_fused_a_gemm(mat_a, mat_b),
         "jit": lambda: dsv3_fused_a_gemm(mat_a, mat_b),
         "sgl_kernel": lambda: sgl_kernel_dsv3_fused_a_gemm(mat_a, mat_b),
         "torch": lambda: F.linear(mat_a, mat_b.T),
     }
-    return run_benchmark_cupti(fn_map[provider])
+    return _median_us(fn_map[provider])
 
 
 @triton.testing.perf_report(
-    triton.testing.Benchmark(
-        x_names=["num_tokens"],
-        x_vals=NUM_TOKENS_LIST,
-        line_arg="provider",
-        line_vals=LINE_VALS,
-        line_names=LINE_NAMES,
-        styles=STYLES,
-        ylabel="us",
-        plot_name="dsv3-fused-a-gemm-bf16",
-        args={},
-    )
+    [
+        triton.testing.Benchmark(
+            x_names=["num_tokens"],
+            x_vals=NUM_TOKENS_LIST,
+            line_arg="provider",
+            line_vals=LINE_VALS,
+            line_names=LINE_NAMES,
+            styles=STYLES,
+            ylabel="us",
+            plot_name=f"dsv3-fused-a-gemm-bf16-K{hd_in}-N{HD_OUT}",
+            args={"hd_in": hd_in},
+        )
+        for hd_in in HD_IN_LIST
+    ]
 )
-def benchmark(num_tokens, provider):
-    return _bench(num_tokens, provider)
+def benchmark(num_tokens, provider, hd_in):
+    return _bench(num_tokens, provider, hd_in)
 
 
 if __name__ == "__main__":
